@@ -132,6 +132,8 @@ sections = [
 [lints.markdown-rel-links]
 kind = "markdown-relative-links"
 exceptions = [
+    '^https://github\.com/ethp2p/ethp2p/blob/[a-f0-9]{40}/(specs/00[23]-ec-broadcast(-rs)?\.md|broadcast/pb/broadcast\.proto)$',
+    '^https://github\.com/libp2p/specs/blob/[a-f0-9]{40}/tls/tls\.md#peer-authentication$',
     '^https://(www\.)?github\.com/ethereum/consensus-specs/(blob|tree)/[a-f0-9]{40}/.+$',
     '^https://(www\.)?github\.com/ethereum/consensus-specs/commit/[a-f0-9]{40}$',
     '^https://(www\.)?github\.com/ethereum/execution-specs/(blob|tree)/[a-f0-9]{40}/.+$',
