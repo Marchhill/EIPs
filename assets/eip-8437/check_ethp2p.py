@@ -28,6 +28,10 @@ class Incomplete(ValueError):
     """FIN before a complete response; not successful delivery."""
 
 
+class OtherStream(ValueError):
+    """Hand non-pull selectors to the shared stream dispatcher."""
+
+
 def require(condition, message):
     if not condition:
         raise Invalid(message)
@@ -115,8 +119,9 @@ class Stream:
 
     def consume(self, value):
         if self.stage == "role":
-            self.role = value[0]
-            require(self.role in (0, 1), "stream type")
+            if value[0] not in (0x10, 0x11):
+                raise OtherStream("not a pull stream")
+            self.role = value[0] - 0x10
             self.stage, self.want = ("request", 8) if self.role else ("header", 5)
         elif self.stage == "request":
             self.request_id = int.from_bytes(value, "big")
@@ -166,16 +171,16 @@ class Stream:
 
 
 STATUS = frame(0, [1, 1, bytes(32), [bytes(32)], 1, MAX_MESSAGE_BYTES])
-CONTROL = b"\x00" + STATUS
-PREFIX = b"\x01" + uint(7, 8)
+CONTROL = b"\x10" + STATUS
+PREFIX = b"\x11" + uint(7, 8)
 COMPLETE = frame(6, [7, bytes(32), 1])  # Unavailable: zero chunks is allowed.
 
 
 class FramingChecks(unittest.TestCase):
     def test_fixed_encodings(self):
         self.assertEqual(frame(7, [7]).hex(), "0700000002c107")
-        self.assertEqual(CONTROL[:1].hex(), "00")
-        self.assertEqual(PREFIX.hex(), "010000000000000007")
+        self.assertEqual(CONTROL[:1].hex(), "10")
+        self.assertEqual(PREFIX.hex(), "110000000000000007")
 
     def test_fragmentation(self):
         cases = ((CONTROL + frame(7, [7]), 0), (PREFIX + COMPLETE, 1),
@@ -209,9 +214,13 @@ class FramingChecks(unittest.TestCase):
             with self.assertRaises(Invalid):
                 stream.feed(bytes([message_id]) + uint(size, 4) + b"unread payload")
             self.assertEqual(stream.payload_bytes_read, already_read)
-        for bad_prefix in (b"\x02", b"\x01" + bytes(8), b"\x01" + uint(8, 8)):
+        for bad_prefix in (b"\x11" + bytes(8), b"\x11" + uint(8, 8)):
             with self.assertRaises(Invalid):
                 Stream().feed(bad_prefix)
+        stream = Stream()
+        with self.assertRaises(OtherStream):
+            stream.feed(b"\x02\x08\x01")  # Broadcast selector: dispatcher owns it.
+        self.assertEqual(stream.payload_bytes_read, 0)
 
     def test_exact_payload_ceilings(self):
         # Stop at the header: its declared length is not a request to allocate
@@ -256,7 +265,7 @@ class FramingChecks(unittest.TestCase):
             stream.fin()
 
     def test_roles_ids_and_retired_prefix(self):
-        for wire in (b"\x00" + frame(7, [7]), CONTROL + STATUS,
+        for wire in (b"\x10" + frame(7, [7]), CONTROL + STATUS,
                      PREFIX + frame(6, [6, bytes(32), 1])):
             with self.assertRaises(Invalid):
                 Stream().feed(wire)
