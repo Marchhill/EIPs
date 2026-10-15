@@ -15,7 +15,6 @@ from check_vectors import rlp, uint
 
 MAX_MESSAGE_BYTES = 131072
 MAX_RLP_DEPTH = 8
-CEILINGS = {3: 65536}
 FIELDS = {0: 6, 2: 2, 3: 2, 4: 3, 5: 4, 6: 3, 7: 1}
 RESPONSES = {2: {3}, 4: {5, 6}}
 
@@ -136,7 +135,7 @@ class Stream:
                 allowed = RESPONSES[self.request_type]
             require(self.message_id in allowed, "message stream role or response type")
             size = int.from_bytes(value[1:], "big")
-            require(1 <= size <= CEILINGS.get(self.message_id, MAX_MESSAGE_BYTES),
+            require(1 <= size <= MAX_MESSAGE_BYTES,
                     "payload length")
             self.stage, self.want = "payload", size
         else:
@@ -225,7 +224,7 @@ class FramingChecks(unittest.TestCase):
         # Stop at the header: its declared length is not a request to allocate
         # or a claim that a payload of that size is a valid message.
         for message_id, request_type, limit in ((5, 4, MAX_MESSAGE_BYTES),
-                                                (3, 2, 65536)):
+                                                (3, 2, MAX_MESSAGE_BYTES)):
             stream = Stream(request_type)
             stream.feed(PREFIX + bytes([message_id]) + uint(limit, 4))
             self.assertEqual(stream.want, limit)
