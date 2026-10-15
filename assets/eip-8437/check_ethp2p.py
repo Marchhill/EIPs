@@ -89,8 +89,9 @@ def frame(message_id, value):
 class Stream:
     """Incremental framing model; payload work starts only after header checks."""
 
-    def __init__(self, request_type=4, highest=7, live=None):
+    def __init__(self, request_type=4, highest=7, live=None, broadcast=False):
         self.request_type = request_type
+        self.broadcast = broadcast
         self.highest = highest
         self.live = {7} if live is None else live
         self.stage, self.want = "role", 1
@@ -119,6 +120,7 @@ class Stream:
     def consume(self, value):
         if self.stage == "role":
             if value[0] not in (0x10, 0x11):
+                require(self.broadcast and value[0] in (1, 2, 3), "unnegotiated stream")
                 raise OtherStream("not a pull stream")
             self.role = value[0] - 0x10
             self.stage, self.want = ("request", 8) if self.role else ("header", 5)
@@ -130,8 +132,9 @@ class Stream:
         elif self.stage == "header":
             self.message_id = value[0]
             require(self.message_id < 8, "message ID")
-            allowed = ({0} if not self.status_seen else {1, 2, 4, 7})
+            allowed = ({0} if not self.status_seen else ({1, 4, 7} | ({2} if self.broadcast else set())))
             if self.role == 1:
+                require(self.request_type == 4 or self.broadcast, "unnegotiated lookup")
                 allowed = RESPONSES[self.request_type]
             require(self.message_id in allowed, "message stream role or response type")
             size = int.from_bytes(value[1:], "big")
@@ -187,7 +190,7 @@ class FramingChecks(unittest.TestCase):
         for wire, role in cases:
             request_type = {3: 2}.get(wire[9] if role else 0, 4)
             for split in range(len(wire) + 1):
-                stream = Stream(request_type)
+                stream = Stream(request_type, broadcast=(request_type == 2))
                 stream.feed(wire[:split])
                 stream.feed(wire[split:])
                 self.assertEqual(stream.role, role)
@@ -195,7 +198,7 @@ class FramingChecks(unittest.TestCase):
                     self.assertFalse(stream.retired)
                     stream.fin()
                     self.assertTrue(stream.retired)
-            stream = Stream(request_type)
+            stream = Stream(request_type, broadcast=(request_type == 2))
             for byte in wire:
                 stream.feed(bytes([byte]))
             self.assertEqual(stream.messages[-1][0], wire[9] if role else 7)
@@ -206,7 +209,7 @@ class FramingChecks(unittest.TestCase):
                  (CONTROL, 7, 0, 4), (CONTROL, 7, MAX_MESSAGE_BYTES + 1, 4),
                  (PREFIX, 3, MAX_MESSAGE_BYTES + 1, 2)]
         for prefix, message_id, size, request_type in cases:
-            stream = Stream(request_type)
+            stream = Stream(request_type, broadcast=(request_type == 2))
             stream.feed(prefix)
             already_read = stream.payload_bytes_read
             with self.assertRaises(Invalid):
@@ -215,17 +218,28 @@ class FramingChecks(unittest.TestCase):
         for bad_prefix in (b"\x11" + bytes(8), b"\x11" + uint(8, 8)):
             with self.assertRaises(Invalid):
                 Stream().feed(bad_prefix)
-        stream = Stream()
+        stream = Stream(broadcast=True)
         with self.assertRaises(OtherStream):
             stream.feed(b"\x02\x08\x01")  # Broadcast selector: dispatcher owns it.
         self.assertEqual(stream.payload_bytes_read, 0)
+
+    def test_retrieval_profile_rejects_broadcast_extension(self):
+        for wire in (CONTROL + frame(2, [7, []]), b"\x01", b"\x02", b"\x03"):
+            with self.assertRaises(Invalid):
+                Stream().feed(wire)
+        with self.assertRaises(Invalid):
+            Stream(request_type=2).feed(PREFIX + frame(3, [7, []]))
+        permitted = Stream(request_type=2, broadcast=True)
+        permitted.feed(PREFIX + frame(3, [7, []]))
+        permitted.fin()
+        self.assertTrue(permitted.retired)
 
     def test_exact_payload_ceilings(self):
         # Stop at the header: its declared length is not a request to allocate
         # or a claim that a payload of that size is a valid message.
         for message_id, request_type, limit in ((5, 4, MAX_MESSAGE_BYTES),
                                                 (3, 2, MAX_MESSAGE_BYTES)):
-            stream = Stream(request_type)
+            stream = Stream(request_type, broadcast=(request_type == 2))
             stream.feed(PREFIX + bytes([message_id]) + uint(limit, 4))
             self.assertEqual(stream.want, limit)
             self.assertEqual(stream.buffer, b"")
