@@ -88,15 +88,14 @@ def coding_for(body, shards):
 
 
 def geometry(manifest):
-    require(isinstance(manifest, list) and len(manifest) == 8, "manifest fields")
-    for index, size in ((0, 32), (1, 4), (5, 32)):
+    require(isinstance(manifest, list) and len(manifest) == 7, "manifest fields")
+    for index, size in ((0, 32), (1, 4), (4, 32)):
         require(isinstance(manifest[index], bytes) and len(manifest[index]) == size,
                 "manifest hash or fork digest")
-    require(all(type(value) is int and 0 <= value < 2**64 for value in manifest[2:5]),
+    require(all(type(value) is int and 0 <= value < 2**64 for value in manifest[2:4]),
             "manifest integer")
-    descriptor, coding = manifest[6:]
+    descriptor, coding = manifest[5:]
     require(isinstance(descriptor, list) and len(descriptor) == 4, "descriptor fields")
-    require(manifest[3] == 0, "broadcast duty")
     require(all(isinstance(descriptor[i], bytes) and len(descriptor[i]) == 32
                 for i in (0, 1, 3)), "descriptor hash")
     length = descriptor[2]
@@ -114,7 +113,7 @@ def geometry(manifest):
 
 def recover(manifest, received):
     length, width = geometry(manifest)  # Before allocating a matrix or output.
-    coding, descriptor = manifest[7], manifest[6]
+    coding, descriptor = manifest[6], manifest[5]
     require(len(received) == DATA, "need sixteen distinct shards")
     indices, shards = zip(*received)
     require(all(type(i) is int and 0 <= i < TOTAL for i in indices)
@@ -139,7 +138,7 @@ def manifest_id(chain, genesis, manifest):
 
 
 def channel(chain, genesis, manifest):
-    descriptor = manifest[6]
+    descriptor = manifest[5]
     scope = [chain, genesis, manifest[0], descriptor[0]]
     return "lean/1/rs/" + h(b"lean/1/channel\0" + rlp(scope)).hex()
 
@@ -185,7 +184,7 @@ BODY, GENESIS = b"12345678901234567", b"\x55" * 32
 def fixture(body=BODY):
     shards = encode(body)
     descriptor = block_commit(body, profile=b"\x22" * 32, block_hash=b"\x66" * 32)
-    manifest = [b"\x11" * 32, b"\x33" * 4, 42, 0, 9, b"\x44" * 32,
+    manifest = [b"\x11" * 32, b"\x33" * 4, 42, 9, b"\x44" * 32,
                 descriptor, coding_for(body, shards)]
     return manifest, shards
 
@@ -202,7 +201,7 @@ class BroadcastChecks(unittest.TestCase):
         self.assertEqual(sha256(BODY).hexdigest(),
                          "97f40b8ae3e4d3118bb4afb623d3e768f04d9bc2f913bd64296ebcd53386c1ac")
         self.assertEqual(manifest_id(1, GENESIS, manifest).hex(),
-                         "6a95cae994289e6a3b890c3157e653b9c03cea69c1a11d8857a173b83f2e41e9")
+                         "b9232cf0a4cefa9357508fedd110fdd385e508afab2cb57105ee5f15000da4fe")
         self.assertEqual(channel(1, GENESIS, manifest),
                          "lean/1/rs/fb2c3ac2b3032b683fbea68a15457c0d2df643110eeb3286c47983be3881ef0f")
 
@@ -217,23 +216,23 @@ class BroadcastChecks(unittest.TestCase):
         invalid = []
         for length in (0, -1, MAX_BODY + 1, 2**64):
             candidate = deepcopy(manifest)
-            candidate[6][2] = length
+            candidate[5][2] = length
             invalid.append(candidate)
         for field, value in ((0, 15), (1, 17), (2, 0), (2, 65537), (4, [])):
             candidate = deepcopy(manifest)
-            candidate[7][field] = value
+            candidate[6][field] = value
             invalid.append(candidate)
-        for descriptor, duty in ((commit(BODY), 0), (manifest[6] + [0], 0),
-                                 (manifest[6], 1)):
+        for descriptor in (commit(BODY), manifest[5] + [0]):
             candidate = deepcopy(manifest)
-            candidate[6], candidate[3] = descriptor, duty
+            candidate[5] = descriptor
             invalid.append(candidate)
+        invalid.append(manifest + [0])
         with patch(__name__ + ".invert", side_effect=AssertionError("decoder initialized")):
             for candidate in invalid:
                 with self.assertRaises(ValueError):
                     recover(candidate, list(enumerate(shards[:16])))
         largest = deepcopy(manifest)
-        largest[6][2], largest[7][2] = MAX_BODY, 65536
+        largest[5][2], largest[6][2] = MAX_BODY, 65536
         self.assertEqual(geometry(largest), (MAX_BODY, 65536))
         with self.assertRaisesRegex(ValueError, "preamble length"):
             preamble(manifest, authorization=bytes(65536))
@@ -244,24 +243,24 @@ class BroadcastChecks(unittest.TestCase):
         for field in (3, 4):
             altered = deepcopy(manifest)
             if field == 3:
-                altered[7][3] = bytes(32)
+                altered[6][3] = bytes(32)
             else:
-                altered[7][4][0] = bytes(32)
+                altered[6][4][0] = bytes(32)
             with self.assertRaises(ValueError):
                 recover(altered, received)
         altered = deepcopy(manifest)
-        altered[6][3] = bytes(32)
+        altered[5][3] = bytes(32)
         with self.assertRaisesRegex(ValueError, "original content commitment"):
             recover(altered, received)
         altered = deepcopy(manifest)
-        altered[7][4][31] = bytes(32)
+        altered[6][4][31] = bytes(32)
         with self.assertRaisesRegex(ValueError, "parity commitment"):
             recover(altered, received)
         # Authenticate a modified padding shard: padding must fail independently
         # of its shard hash and the hash of the truncated original body.
         altered = deepcopy(manifest)
         bad = shards[15][:-1] + b"\x01"
-        altered[7][4][15] = sha256(bad).digest()
+        altered[6][4][15] = sha256(bad).digest()
         with self.assertRaisesRegex(ValueError, "padding"):
             recover(altered, received[:-1] + [(15, bad)])
         with self.assertRaises(ValueError):
