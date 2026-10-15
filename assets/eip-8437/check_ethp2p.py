@@ -15,7 +15,7 @@ from check_vectors import rlp, uint
 
 MAX_MESSAGE_BYTES = 131072
 MAX_RLP_DEPTH = 8
-FIELDS = {0: 6, 4: 3, 5: 4, 6: 3, 7: 1}
+FIELDS = {0: 5, 4: 3, 5: 4, 6: 3, 7: 1}
 RESPONSES = {4: {5, 6}}
 
 
@@ -137,16 +137,13 @@ class Stream:
             fields = decode(value)
             if self.message_id in FIELDS:
                 require(len(fields) == FIELDS[self.message_id], "field count")
-            if self.message_id in (2, 3, 4, 5, 6, 7):
+            if self.message_id in (4, 5, 6, 7):
                 request_id = number(fields[0])
                 if self.role == 1:
                     require(request_id == self.request_id, "frame/prefix ID mismatch")
             if self.message_id == 0:
                 require(number(fields[0]) == 1, "Status version")
                 self.status_seen = True
-            if self.message_id == 3:
-                require(isinstance(fields[1], list) and len(fields[1]) <= 16,
-                        "response result list")
             if self.message_id in (5, 6):
                 require(isinstance(fields[1], bytes) and len(fields[1]) == 32,
                         "object ID shape")
@@ -164,7 +161,7 @@ class Stream:
         self.retired = True
 
 
-STATUS = frame(0, [1, 1, bytes(32), [bytes(32)], 1, MAX_MESSAGE_BYTES])
+STATUS = frame(0, [1, 1, bytes(32), [bytes(32)], MAX_MESSAGE_BYTES])
 CONTROL = b"\x10" + STATUS
 PREFIX = b"\x11" + uint(7, 8)
 COMPLETE = frame(6, [7, bytes(32), 1])  # Unavailable: zero chunks is allowed.
@@ -175,6 +172,11 @@ class FramingChecks(unittest.TestCase):
         self.assertEqual(frame(7, [7]).hex(), "0700000002c107")
         self.assertEqual(CONTROL[:1].hex(), "10")
         self.assertEqual(PREFIX.hex(), "110000000000000007")
+
+    def test_status_field_count(self):
+        old_status = frame(0, [1, 1, bytes(32), [bytes(32)], 1, MAX_MESSAGE_BYTES])
+        with self.assertRaises(Invalid):
+            Stream().feed(b"\x10" + old_status)
 
     def test_fragmentation(self):
         cases = ((CONTROL + frame(7, [7]), 0), (PREFIX + COMPLETE, 1))
