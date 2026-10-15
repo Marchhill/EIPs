@@ -15,7 +15,7 @@ from check_vectors import rlp, uint
 
 MAX_MESSAGE_BYTES = 131072
 MAX_RLP_DEPTH = 8
-FIELDS = {0: 6, 2: 2, 3: 2, 4: 3, 5: 4, 6: 3, 7: 1}
+FIELDS = {0: 5, 2: 2, 3: 2, 4: 3, 5: 4, 6: 3, 7: 1}
 RESPONSES = {2: {3}, 4: {5, 6}}
 
 
@@ -172,7 +172,7 @@ class Stream:
         self.retired = True
 
 
-STATUS = frame(0, [1, 1, bytes(32), [bytes(32)], 1, MAX_MESSAGE_BYTES])
+STATUS = frame(0, [1, 1, bytes(32), [bytes(32)], MAX_MESSAGE_BYTES])
 CONTROL = b"\x10" + STATUS
 PREFIX = b"\x11" + uint(7, 8)
 COMPLETE = frame(6, [7, bytes(32), 1])  # Unavailable: zero chunks is allowed.
@@ -183,6 +183,11 @@ class FramingChecks(unittest.TestCase):
         self.assertEqual(frame(7, [7]).hex(), "0700000002c107")
         self.assertEqual(CONTROL[:1].hex(), "10")
         self.assertEqual(PREFIX.hex(), "110000000000000007")
+
+    def test_status_field_count(self):
+        old_status = frame(0, [1, 1, bytes(32), [bytes(32)], 1, MAX_MESSAGE_BYTES])
+        with self.assertRaises(Invalid):
+            Stream().feed(b"\x10" + old_status)
 
     def test_fragmentation(self):
         cases = ((CONTROL + frame(7, [7]), 0), (PREFIX + COMPLETE, 1),

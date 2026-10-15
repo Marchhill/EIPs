@@ -13,7 +13,7 @@ from hashlib import sha256
 import unittest
 from unittest.mock import patch
 
-from check_vectors import commit, h, rlp
+from check_vectors import block_commit, commit, h, rlp
 
 
 DATA, TOTAL, MAX_BODY = 16, 32, 2**20
@@ -95,9 +95,11 @@ def geometry(manifest):
     require(all(type(value) is int and 0 <= value < 2**64 for value in manifest[2:5]),
             "manifest integer")
     descriptor, coding = manifest[6:]
-    require(isinstance(descriptor, list) and len(descriptor) == 5, "descriptor fields")
-    require(descriptor[0] == 2 and manifest[3] == 0, "broadcast kind")
-    length = descriptor[3]
+    require(isinstance(descriptor, list) and len(descriptor) == 4, "descriptor fields")
+    require(manifest[3] == 0, "broadcast duty")
+    require(all(isinstance(descriptor[i], bytes) and len(descriptor[i]) == 32
+                for i in (0, 1, 3)), "descriptor hash")
+    length = descriptor[2]
     require(type(length) is int and 1 <= length <= MAX_BODY, "body length")
     require(isinstance(coding, list) and len(coding) == 5, "coding fields")
     require(coding[:2] == [DATA, DATA], "RS geometry")
@@ -125,8 +127,8 @@ def recover(manifest, received):
     require(not any(padded[length:]), "nonzero padding")
     body = padded[:length]
     require(sha256(body).digest() == coding[3], "body SHA256")
-    require(h(body) == descriptor[4], "original content commitment")
-    rebuilt = commit(body, descriptor[0], descriptor[1], descriptor[2])
+    require(h(body) == descriptor[3], "original content commitment")
+    rebuilt = block_commit(body, descriptor[0], descriptor[1])
     require(rebuilt == descriptor, "original object commitment")
     require(coding_for(body, encode(body)) == coding, "noncanonical parity commitment")
     return body
@@ -138,7 +140,7 @@ def manifest_id(chain, genesis, manifest):
 
 def channel(chain, genesis, manifest):
     descriptor = manifest[6]
-    scope = [chain, genesis, manifest[0], descriptor[0], descriptor[1]]
+    scope = [chain, genesis, manifest[0], descriptor[0]]
     return "lean/1/rs/" + h(b"lean/1/channel\0" + rlp(scope)).hex()
 
 
@@ -182,7 +184,7 @@ BODY, GENESIS = b"12345678901234567", b"\x55" * 32
 
 def fixture(body=BODY):
     shards = encode(body)
-    descriptor = commit(body, kind=2, profile=b"\x22" * 32, context=[b"\x66" * 32])
+    descriptor = block_commit(body, profile=b"\x22" * 32, block_hash=b"\x66" * 32)
     manifest = [b"\x11" * 32, b"\x33" * 4, 42, 0, 9, b"\x44" * 32,
                 descriptor, coding_for(body, shards)]
     return manifest, shards
@@ -200,9 +202,9 @@ class BroadcastChecks(unittest.TestCase):
         self.assertEqual(sha256(BODY).hexdigest(),
                          "97f40b8ae3e4d3118bb4afb623d3e768f04d9bc2f913bd64296ebcd53386c1ac")
         self.assertEqual(manifest_id(1, GENESIS, manifest).hex(),
-                         "ef5e6a8395ac1f23d6e6179b0454f7ac6131d911c96dfb23990b836a02c2c6a7")
+                         "6a95cae994289e6a3b890c3157e653b9c03cea69c1a11d8857a173b83f2e41e9")
         self.assertEqual(channel(1, GENESIS, manifest),
-                         "lean/1/rs/c6f07ea02f8a1d325716da3fb6befadb26c836dc702d9ec82004ba6968af101c")
+                         "lean/1/rs/fb2c3ac2b3032b683fbea68a15457c0d2df643110eeb3286c47983be3881ef0f")
 
     def test_reconstruction_with_data_loss(self):
         for body in (b"x", bytes(range(16)), BODY, bytes(range(127)), bytes(range(251)) * 3):
@@ -215,22 +217,23 @@ class BroadcastChecks(unittest.TestCase):
         invalid = []
         for length in (0, -1, MAX_BODY + 1, 2**64):
             candidate = deepcopy(manifest)
-            candidate[6][3] = length
+            candidate[6][2] = length
             invalid.append(candidate)
         for field, value in ((0, 15), (1, 17), (2, 0), (2, 65537), (4, [])):
             candidate = deepcopy(manifest)
             candidate[7][field] = value
             invalid.append(candidate)
-        for kind, duty in ((1, 0), (3, 0), (2, 1)):
+        for descriptor, duty in ((commit(BODY), 0), (manifest[6] + [0], 0),
+                                 (manifest[6], 1)):
             candidate = deepcopy(manifest)
-            candidate[6][0], candidate[3] = kind, duty
+            candidate[6], candidate[3] = descriptor, duty
             invalid.append(candidate)
         with patch(__name__ + ".invert", side_effect=AssertionError("decoder initialized")):
             for candidate in invalid:
                 with self.assertRaises(ValueError):
                     recover(candidate, list(enumerate(shards[:16])))
         largest = deepcopy(manifest)
-        largest[6][3], largest[7][2] = MAX_BODY, 65536
+        largest[6][2], largest[7][2] = MAX_BODY, 65536
         self.assertEqual(geometry(largest), (MAX_BODY, 65536))
         with self.assertRaisesRegex(ValueError, "preamble length"):
             preamble(manifest, authorization=bytes(65536))
@@ -247,7 +250,7 @@ class BroadcastChecks(unittest.TestCase):
             with self.assertRaises(ValueError):
                 recover(altered, received)
         altered = deepcopy(manifest)
-        altered[6][4] = bytes(32)
+        altered[6][3] = bytes(32)
         with self.assertRaisesRegex(ValueError, "original content commitment"):
             recover(altered, received)
         altered = deepcopy(manifest)
