@@ -15,8 +15,8 @@ from check_vectors import rlp, uint
 
 MAX_MESSAGE_BYTES = 131072
 MAX_RLP_DEPTH = 8
-FIELDS = {0: 6, 2: 2, 3: 2, 4: 3, 5: 4, 6: 3, 7: 1}
-RESPONSES = {2: {3}, 4: {5, 6}}
+FIELDS = {0: 6, 4: 3, 5: 4, 6: 3, 7: 1}
+RESPONSES = {4: {5, 6}}
 
 
 class Invalid(ValueError):
@@ -125,7 +125,7 @@ class Stream:
         elif self.stage == "header":
             self.message_id = value[0]
             require(self.message_id < 8, "message ID")
-            allowed = ({0} if not self.status_seen else {1, 2, 4, 7})
+            allowed = ({0} if not self.status_seen else {1, 4, 7})
             if self.role == 1:
                 allowed = RESPONSES[self.request_type]
             require(self.message_id in allowed, "message stream role or response type")
@@ -152,7 +152,7 @@ class Stream:
                         "object ID shape")
                 number(fields[2], 4 if self.message_id == 5 else 1)
             self.messages.append((self.message_id, fields))
-            self.terminal = self.role == 1 and self.message_id in (3, 6)
+            self.terminal = self.role == 1 and self.message_id == 6
             self.stage, self.want = "header", 5
 
     def fin(self):
@@ -177,10 +177,9 @@ class FramingChecks(unittest.TestCase):
         self.assertEqual(PREFIX.hex(), "110000000000000007")
 
     def test_fragmentation(self):
-        cases = ((CONTROL + frame(7, [7]), 0), (PREFIX + COMPLETE, 1),
-                 (PREFIX + frame(3, [7, [[2, b""]]]), 1))
+        cases = ((CONTROL + frame(7, [7]), 0), (PREFIX + COMPLETE, 1))
         for wire, role in cases:
-            request_type = {3: 2}.get(wire[9] if role else 0, 4)
+            request_type = 4
             for split in range(len(wire) + 1):
                 stream = Stream(request_type)
                 stream.feed(wire[:split])
@@ -199,7 +198,8 @@ class FramingChecks(unittest.TestCase):
         cases = [(CONTROL, 8, 1, 4), (CONTROL, 5, 1, 4),
                  (PREFIX, 7, 1, 4), (PREFIX, 3, 1, 4),
                  (CONTROL, 7, 0, 4), (CONTROL, 7, MAX_MESSAGE_BYTES + 1, 4),
-                 (PREFIX, 3, MAX_MESSAGE_BYTES + 1, 2)]
+                 (PREFIX, 5, MAX_MESSAGE_BYTES + 1, 4),
+                 (CONTROL, 2, 1, 4), (PREFIX, 3, 1, 4)]
         for prefix, message_id, size, request_type in cases:
             stream = Stream(request_type)
             stream.feed(prefix)
@@ -218,8 +218,7 @@ class FramingChecks(unittest.TestCase):
     def test_exact_payload_ceilings(self):
         # Stop at the header: its declared length is not a request to allocate
         # or a claim that a payload of that size is a valid message.
-        for message_id, request_type, limit in ((5, 4, MAX_MESSAGE_BYTES),
-                                                (3, 2, MAX_MESSAGE_BYTES)):
+        for message_id, request_type, limit in ((5, 4, MAX_MESSAGE_BYTES),):
             stream = Stream(request_type)
             stream.feed(PREFIX + bytes([message_id]) + uint(limit, 4))
             self.assertEqual(stream.want, limit)
