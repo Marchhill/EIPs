@@ -15,8 +15,8 @@ from check_vectors import rlp, uint
 
 MAX_MESSAGE_BYTES = 131072
 MAX_RLP_DEPTH = 8
-FIELDS = {0: 5, 4: 3, 5: 4, 6: 3, 7: 1}
-RESPONSES = {4: {5, 6}}
+FIELDS = {0: 5, 2: 3, 3: 4, 4: 3, 5: 1}
+RESPONSES = {2: {3, 4}}
 
 
 class Invalid(ValueError):
@@ -85,7 +85,7 @@ def frame(message_id, value):
 class Stream:
     """Incremental framing model; payload work starts only after header checks."""
 
-    def __init__(self, request_type=4, highest=7, live=None):
+    def __init__(self, request_type=2, highest=7, live=None):
         self.request_type = request_type
         self.highest = highest
         self.live = {7} if live is None else live
@@ -124,8 +124,8 @@ class Stream:
             self.want = 5
         elif self.stage == "header":
             self.message_id = value[0]
-            require(self.message_id < 8, "message ID")
-            allowed = ({0} if not self.status_seen else {1, 4, 7})
+            require(self.message_id < 6, "message ID")
+            allowed = ({0} if not self.status_seen else {1, 2, 5})
             if self.role == 1:
                 allowed = RESPONSES[self.request_type]
             require(self.message_id in allowed, "message stream role or response type")
@@ -137,19 +137,19 @@ class Stream:
             fields = decode(value)
             if self.message_id in FIELDS:
                 require(len(fields) == FIELDS[self.message_id], "field count")
-            if self.message_id in (4, 5, 6, 7):
+            if self.message_id in (2, 3, 4, 5):
                 request_id = number(fields[0])
                 if self.role == 1:
                     require(request_id == self.request_id, "frame/prefix ID mismatch")
             if self.message_id == 0:
                 require(number(fields[0]) == 1, "Status version")
                 self.status_seen = True
-            if self.message_id in (5, 6):
+            if self.message_id in (3, 4):
                 require(isinstance(fields[1], bytes) and len(fields[1]) == 32,
                         "object ID shape")
-                number(fields[2], 4 if self.message_id == 5 else 1)
+                number(fields[2], 4 if self.message_id == 3 else 1)
             self.messages.append((self.message_id, fields))
-            self.terminal = self.role == 1 and self.message_id == 6
+            self.terminal = self.role == 1 and self.message_id == 4
             self.stage, self.want = "header", 5
 
     def fin(self):
@@ -164,24 +164,28 @@ class Stream:
 STATUS = frame(0, [1, 1, bytes(32), [bytes(32)], MAX_MESSAGE_BYTES])
 CONTROL = b"\x10" + STATUS
 PREFIX = b"\x11" + uint(7, 8)
-COMPLETE = frame(6, [7, bytes(32), 1])  # Unavailable: zero chunks is allowed.
+COMPLETE = frame(4, [7, bytes(32), 1])  # Unavailable: zero chunks is allowed.
 
 
 class FramingChecks(unittest.TestCase):
     def test_fixed_encodings(self):
-        self.assertEqual(frame(7, [7]).hex(), "0700000002c107")
+        self.assertEqual(frame(5, [7]).hex(), "0500000002c107")
+        self.assertEqual(frame(2, [7, bytes(32), [0]]).hex(),
+                         "0200000025e407a0" + "00" * 32 + "c180")
+        self.assertEqual(frame(3, [7, bytes(32), 0, b"a"]).hex(),
+                         "0300000025e407a0" + "00" * 32 + "8061")
         self.assertEqual(CONTROL[:1].hex(), "10")
         self.assertEqual(PREFIX.hex(), "110000000000000007")
 
     def test_status_field_count(self):
-        old_status = frame(0, [1, 1, bytes(32), [bytes(32)], 1, MAX_MESSAGE_BYTES])
+        extra_field_status = frame(0, [1, 1, bytes(32), [bytes(32)], 1, MAX_MESSAGE_BYTES])
         with self.assertRaises(Invalid):
-            Stream().feed(b"\x10" + old_status)
+            Stream().feed(b"\x10" + extra_field_status)
 
     def test_fragmentation(self):
-        cases = ((CONTROL + frame(7, [7]), 0), (PREFIX + COMPLETE, 1))
+        cases = ((CONTROL + frame(5, [7]), 0), (PREFIX + COMPLETE, 1))
         for wire, role in cases:
-            request_type = 4
+            request_type = 2
             for split in range(len(wire) + 1):
                 stream = Stream(request_type)
                 stream.feed(wire[:split])
@@ -194,14 +198,13 @@ class FramingChecks(unittest.TestCase):
             stream = Stream(request_type)
             for byte in wire:
                 stream.feed(bytes([byte]))
-            self.assertEqual(stream.messages[-1][0], wire[9] if role else 7)
+            self.assertEqual(stream.messages[-1][0], wire[9] if role else 5)
 
     def test_header_rejection_before_payload(self):
-        cases = [(CONTROL, 8, 1, 4), (CONTROL, 5, 1, 4),
-                 (PREFIX, 7, 1, 4), (PREFIX, 3, 1, 4),
-                 (CONTROL, 7, 0, 4), (CONTROL, 7, MAX_MESSAGE_BYTES + 1, 4),
-                 (PREFIX, 5, MAX_MESSAGE_BYTES + 1, 4),
-                 (CONTROL, 2, 1, 4), (PREFIX, 3, 1, 4)]
+        cases = [(CONTROL, 6, 1, 2), (CONTROL, 7, 1, 2),
+                 (CONTROL, 3, 1, 2), (PREFIX, 5, 1, 2), (PREFIX, 1, 1, 2),
+                 (CONTROL, 5, 0, 2), (CONTROL, 5, MAX_MESSAGE_BYTES + 1, 2),
+                 (PREFIX, 3, MAX_MESSAGE_BYTES + 1, 2)]
         for prefix, message_id, size, request_type in cases:
             stream = Stream(request_type)
             stream.feed(prefix)
@@ -214,13 +217,13 @@ class FramingChecks(unittest.TestCase):
                 Stream().feed(bad_prefix)
         stream = Stream()
         with self.assertRaises(Invalid):
-            stream.feed(b"\x02\x08\x01")  # No extension was negotiated.
+            stream.feed(b"\x02\x08\x01")  # Unknown stream selector.
         self.assertEqual(stream.payload_bytes_read, 0)
 
     def test_exact_payload_ceilings(self):
         # Stop at the header: its declared length is not a request to allocate
         # or a claim that a payload of that size is a valid message.
-        for message_id, request_type, limit in ((5, 4, MAX_MESSAGE_BYTES),):
+        for message_id, request_type, limit in ((3, 2, MAX_MESSAGE_BYTES),):
             stream = Stream(request_type)
             stream.feed(PREFIX + bytes([message_id]) + uint(limit, 4))
             self.assertEqual(stream.want, limit)
@@ -234,7 +237,7 @@ class FramingChecks(unittest.TestCase):
                      rlp([[]]), rlp([2**64]), rlp([7] * 65))
         for payload in malformed:
             with self.assertRaises(Invalid):
-                Stream().feed(CONTROL + b"\x07" + uint(len(payload), 4) + payload)
+                Stream().feed(CONTROL + b"\x05" + uint(len(payload), 4) + payload)
         nested = []
         for _ in range(MAX_RLP_DEPTH - 1):
             nested = [nested]
@@ -259,8 +262,8 @@ class FramingChecks(unittest.TestCase):
             stream.fin()
 
     def test_roles_ids_and_retired_prefix(self):
-        for wire in (b"\x10" + frame(7, [7]), CONTROL + STATUS,
-                     PREFIX + frame(6, [6, bytes(32), 1])):
+        for wire in (b"\x10" + frame(5, [7]), CONTROL + STATUS,
+                     PREFIX + frame(4, [6, bytes(32), 1])):
             with self.assertRaises(Invalid):
                 Stream().feed(wire)
         stream = Stream(live=set())
@@ -270,11 +273,11 @@ class FramingChecks(unittest.TestCase):
         self.assertEqual(stream.messages, [])
 
     def test_chunk_then_terminal(self):
-        chunk = frame(5, [7, bytes(32), 0, b"opaque chunk"])
+        chunk = frame(3, [7, bytes(32), 0, b"opaque chunk"])
         stream = Stream()
         for byte in PREFIX + chunk + COMPLETE:
             stream.feed(bytes([byte]))
-        self.assertEqual([item[0] for item in stream.messages], [5, 6])
+        self.assertEqual([item[0] for item in stream.messages], [3, 4])
         self.assertFalse(stream.retired)
         stream.fin()
         self.assertTrue(stream.retired)
