@@ -27,10 +27,6 @@ class Incomplete(ValueError):
     """FIN before a complete response; not successful delivery."""
 
 
-class OtherStream(ValueError):
-    """Hand non-pull selectors to the shared stream dispatcher."""
-
-
 def require(condition, message):
     if not condition:
         raise Invalid(message)
@@ -118,8 +114,7 @@ class Stream:
 
     def consume(self, value):
         if self.stage == "role":
-            if value[0] not in (0x10, 0x11):
-                raise OtherStream("not a pull stream")
+            require(value[0] in (0x10, 0x11), "stream selector")
             self.role = value[0] - 0x10
             self.stage, self.want = ("request", 8) if self.role else ("header", 5)
         elif self.stage == "request":
@@ -204,7 +199,7 @@ class FramingChecks(unittest.TestCase):
         cases = [(CONTROL, 8, 1, 4), (CONTROL, 5, 1, 4),
                  (PREFIX, 7, 1, 4), (PREFIX, 3, 1, 4),
                  (CONTROL, 7, 0, 4), (CONTROL, 7, MAX_MESSAGE_BYTES + 1, 4),
-                 (PREFIX, 3, 65537, 2)]
+                 (PREFIX, 3, MAX_MESSAGE_BYTES + 1, 2)]
         for prefix, message_id, size, request_type in cases:
             stream = Stream(request_type)
             stream.feed(prefix)
@@ -216,8 +211,8 @@ class FramingChecks(unittest.TestCase):
             with self.assertRaises(Invalid):
                 Stream().feed(bad_prefix)
         stream = Stream()
-        with self.assertRaises(OtherStream):
-            stream.feed(b"\x02\x08\x01")  # Broadcast selector: dispatcher owns it.
+        with self.assertRaises(Invalid):
+            stream.feed(b"\x02\x08\x01")  # No extension was negotiated.
         self.assertEqual(stream.payload_bytes_read, 0)
 
     def test_exact_payload_ceilings(self):
