@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check EIP-8437 content commitments and wire bounds, not proof validity.
+"""Check EIP-8437 announcements, message encodings and response limits, not proof validity.
 
 Requires Python 3.9+ and pycryptodome. Run with:
     python3 assets/eip-8437/check_vectors.py
@@ -10,8 +10,13 @@ from pathlib import Path
 
 from Crypto.Hash import keccak
 
-CHUNK_BYTES = 65536
-MAX_OBJECT_BYTES = 9437184
+SOFT_RESPONSE_LIMIT = 2097152
+MAX_WRAPPER_BYTES = SOFT_RESPONSE_LIMIT
+MAX_ANNOUNCEMENTS = 64
+MAX_WRAPPERS_PER_REQUEST = 64
+MAX_TXS_PER_WRAPPER = 4096
+MAX_DEPS_PER_AGGREGATE_WRAPPER = 4096
+LEANSPHINCS_SCHEME = 0x10
 
 
 def h(data):
@@ -41,108 +46,175 @@ def rlp(value):
     return bytes([offset + 55 + len(size)]) + size + payload
 
 
-def domain(name):
-    return b"lean/1/" + name.encode("ascii") + b"\0"
-
-
 def pattern(size):
     return (bytes(range(251)) * ((size + 250) // 251))[:size]
 
 
-def commit(body, profile=bytes(32)):
-    if not 1 <= len(body) <= MAX_OBJECT_BYTES:
-        raise ValueError("object size")
-    return [profile, len(body), h(body)]
+def describe(body):
+    # Each NewProofWrapperHashes entry is [length, hash].
+    if not 1 <= len(body) <= MAX_WRAPPER_BYTES:
+        raise ValueError("wrapper size")
+    return [len(body), h(body)]
 
 
-def block_commit(body, profile, block_hash):
-    wrapper = commit(body, profile)
-    return [wrapper[0], block_hash, wrapper[1], wrapper[2]]
+def encode_dep(scheme, data_hash, key):
+    # EIP-8288 96-byte dependency encoding, after zero data_hash substitution.
+    return bytes(31) + bytes([scheme]) + data_hash + key
 
 
-def block_object_id(descriptor):
-    return h(b"lean/1/block\0" + rlp(descriptor))
+def placeholder_deps_hash(encoded_deps):
+    # Keccak-256 stands in for the fork's DEPS_HASH; only the encoding is normative.
+    return h(b"".join(encoded_deps))
 
 
-def object_id(descriptor):
-    return h(domain("object") + rlp(descriptor))
+def wrapper_vectors():
+    deps = sorted(encode_dep(LEANSPHINCS_SCHEME, h(b"message %d" % i), uint(i + 1, 32))
+                  for i in range(2))
+    hashes = sorted(h(b"transaction %d" % i) for i in range(2))
+    bodies = {
+        "mode0": rlp([hashes, 0, [deps, [b"witness 0", b"witness 1"]]]),
+        "mode1": rlp([hashes, 1, [deps, b"aggregate proof"]]),
+    }
+    out = {
+        "deps": [d.hex() for d in deps],
+        "placeholder_deps_hash": placeholder_deps_hash(deps).hex(),
+        "placeholder_empty_deps_hash": placeholder_deps_hash([]).hex(),
+        "transactions": [x.hex() for x in hashes],
+    }
+    for name, body in bodies.items():
+        descriptor = describe(body)
+        out[name] = {
+            "body": body.hex(),
+            "content_hash": descriptor[1].hex(),
+            "descriptor_rlp": rlp(descriptor).hex(),
+        }
+    return out
+
+
+def response(request_id, items):
+    # Requested items in order: the first always, then stop before passing the soft limit.
+    served = []
+    for item in items:
+        if served and len(rlp([request_id, served + [item]])) > SOFT_RESPONSE_LIMIT:
+            break
+        served.append(item)
+    return rlp([request_id, served])
+
+
+def check_envelopes(requested_hashes, envelopes):
+    # PooledTransactions may omit entries, but may not repeat or reorder them.
+    remaining = iter(requested_hashes)
+    for envelope in envelopes:
+        envelope_hash = h(envelope)
+        if not any(requested == envelope_hash for requested in remaining):
+            raise ValueError("unrequested or misordered envelope")
+
+
+def wrappers_response(request_id, wrappers):
+    # A wrapper is embedded as its RLP item: splice its exact bytes into the list.
+    served = []
+    for wrapper in wrappers:
+        if served and len(splice(request_id, served + [wrapper])) > SOFT_RESPONSE_LIMIT:
+            break
+        served.append(wrapper)
+    return splice(request_id, served)
+
+
+def splice(request_id, encoded_items):
+    return rlp_list(rlp(request_id) + rlp_list(b"".join(encoded_items)))
+
+
+def rlp_list(payload):
+    if len(payload) < 56:
+        return bytes([0xc0 + len(payload)]) + payload
+    size = uint(len(payload), (len(payload).bit_length() + 7) // 8)
+    return bytes([0xf7 + len(size)]) + size + payload
 
 
 def vector(size):
-    descriptor = commit(pattern(size))
+    descriptor = describe(pattern(size))
     return {
         "size": size,
-        "chunk_count": (size + CHUNK_BYTES - 1) // CHUNK_BYTES,
-        "content_hash": descriptor[2].hex(),
+        "content_hash": descriptor[1].hex(),
         "descriptor_rlp": rlp(descriptor).hex(),
-        "object_id": object_id(descriptor).hex(),
-        "last_chunk_bytes": (size - 1) % CHUNK_BYTES + 1,
     }
+
+
+def expect_error(fn, *args):
+    try:
+        fn(*args)
+    except (ValueError, AssertionError):
+        return
+    raise AssertionError("accepted invalid input")
 
 
 def main():
     assert h(b"").hex() == "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
     assert rlp(0) == b"\x80" and rlp([]) == b"\xc0"
     assert rlp(b"dog").hex() == "83646f67"
-    vectors = json.loads(Path(__file__).with_name("commitment-vectors.json").read_text())
+    vectors = json.loads(Path(__file__).with_name("announcement-vectors.json").read_text())
     for expected in vectors:
         assert vector(expected["size"]) == expected, expected["size"]
+    wrappers = json.loads(Path(__file__).with_name("wrapper-vectors.json").read_text())
+    assert wrapper_vectors() == wrappers
 
-    sizes = (1, 65535, 65536, 65537, 131072, 131073, MAX_OBJECT_BYTES)
-    for size in sizes:
-        body = pattern(size)
-        descriptor = commit(body)
-        chunks = [body[i:i + CHUNK_BYTES] for i in range(0, size, CHUNK_BYTES)]
-        assert 1 <= len(chunks) <= 144
-        assert all(len(c) == CHUNK_BYTES for c in chunks[:-1])
-        assert len(chunks[-1]) == (size - 1) % CHUNK_BYTES + 1
-        assert h(b"".join(chunks)) == descriptor[2]
-        corrupted = [bytes([chunks[0][0] ^ 1]) + chunks[0][1:]] + chunks[1:]
-        assert h(b"".join(corrupted)) != descriptor[2]
-        # Every metadata field participates in object identity.
-        for field, value in ((0, h(b"profile")), (1, size + 1), (2, bytes(32))):
-            changed = list(descriptor)
-            changed[field] = value
-            assert object_id(changed) != object_id(descriptor)
-    for body in (b"", bytes(MAX_OBJECT_BYTES + 1)):
-        try:
-            commit(body)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("accepted invalid object length")
+    for size in (1, 65536, 131073, MAX_WRAPPER_BYTES):
+        # A one-byte change gives a different content hash, hence a different object.
+        corrupted = bytes([pattern(size)[0] ^ 1]) + pattern(size)[1:]
+        assert h(corrupted) != describe(pattern(size))[1]
+    expect_error(describe, b"")
+    expect_error(describe, bytes(MAX_WRAPPER_BYTES + 1))
+    # A maximum-length descriptor encodes in 38 bytes.
+    assert len(rlp([MAX_WRAPPER_BYTES, bytes(32)])) == 38
 
-    # Published request and chunk encodings.
-    assert rlp([7]).hex() == "c107"
-    assert rlp([7, bytes(32), [0, 2]]).hex() == "e507a0" + "00" * 32 + "c28002"
-    assert rlp([7, bytes(32), 0, b"a"]).hex() == "e407a0" + "00" * 32 + "8061"
-    largest_chunk = rlp([2**64 - 1, bytes(32), 143, bytes(CHUNK_BYTES)])
-    assert len(largest_chunk) < 131072
-    descriptor = [bytes(32), bytes(32), MAX_OBJECT_BYTES, bytes(32)]
-    assert len(rlp([descriptor] * 64)) < 131072
-    assert len(rlp([2**64 - 1, [[0, descriptor]] * 16])) < 131072
+    # GetProofWrappers (0x17) and NewProofWrapperHashes (0x16) at their 64-entry limits.
+    assert rlp([7, [bytes(32)]]).hex() == "e307e1a0" + "00" * 32
+    max_id = 2**64 - 1
+    announced = [[MAX_WRAPPER_BYTES, uint(i + 1, 32)] for i in range(MAX_ANNOUNCEMENTS)]
+    requested_hashes = [uint(i + 1, 32) for i in range(MAX_WRAPPERS_PER_REQUEST)]
+    assert len(rlp(announced)) == 2435
+    assert len(rlp([max_id, requested_hashes])) == 2127
 
-    # The aggregate wrapper fits without embedding any transaction envelopes.
-    hashes = [uint(i, 32) for i in range(4096)]
-    deps = [bytes(31) + b"\x10" + uint(i, 32) + bytes(32) for i in range(4096)]
-    maximum_wrapper = rlp([hashes, 1, [deps, bytes(8388608)]])
-    assert len(maximum_wrapper) <= MAX_OBJECT_BYTES
+    # ProofWrappers (0x18): wrappers are embedded as RLP items, hashed as sent.
+    mode1 = bytes.fromhex(wrappers["mode1"]["body"])
+    assert wrappers_response(7, [mode1]) == bytes.fromhex("f9012407f90120") + mode1
+    # A wrapper of exactly MAX_WRAPPER_BYTES is served alone: the first item is always included.
+    hashes = [uint(i + 1, 32) for i in range(MAX_TXS_PER_WRAPPER)]
+    deps = [bytes(31) + bytes([LEANSPHINCS_SCHEME]) + uint(i, 32) + bytes(32)
+            for i in range(MAX_DEPS_PER_AGGREGATE_WRAPPER)]
+    proof_room = MAX_WRAPPER_BYTES - len(rlp([hashes, 1, [deps, b""]]))
+    while len(rlp([hashes, 1, [deps, bytes(proof_room)]])) > MAX_WRAPPER_BYTES:
+        proof_room -= 1
+    largest = rlp([hashes, 1, [deps, bytes(proof_room)]])
+    assert len(largest) == MAX_WRAPPER_BYTES and proof_room == 1560555
+    assert len(rlp(hashes)) + len(rlp(deps)) == 536584
+    assert len(wrappers_response(max_id, [largest, mode1])) == MAX_WRAPPER_BYTES + 17
+    # Responses stop before the wrapper that would pass the soft limit.
+    medium = rlp([hashes[:1], 1, [deps[:1], bytes(600000)]])
+    assert wrappers_response(7, [medium] * 4) == splice(7, [medium] * 3)
 
-    # Header commitment binds the raw proof, not its lean transport RLP.
-    proof = b"proof"
-    proof_hash = h(proof)
-    block_hash = h(rlp([b"synthetic header", [proof_hash, h(b"dependencies")]]))
-    descriptor = block_commit(rlp([proof]), h(b"profile"), block_hash)
-    assert descriptor[3] != proof_hash
-    assert block_object_id(descriptor) != object_id(descriptor)
-    for field, value in ((0, bytes(32)), (1, bytes(32)), (2, 1), (3, bytes(32))):
-        changed = list(descriptor)
-        changed[field] = value
-        assert block_object_id(changed) != block_object_id(descriptor)
-    assert h(proof + b"!") != proof_hash
-    assert block_commit(rlp([b""]), h(b"profile"), block_hash)[2] == 2
-    print(f"PASS: {len(vectors)} vectors, {len(sizes)} boundaries, identity mutations, "
-          f"message bounds and proof commitments; maximum wrapper {len(maximum_wrapper)} bytes")
+    # Existing PooledTransactions (0x0a) encoding for typed transaction envelopes.
+    assert rlp([7, [b"\x02\xc0"]]).hex() == "c507c38202c0"
+    assert len(response(max_id, [bytes(SOFT_RESPONSE_LIMIT)] * 2)) == SOFT_RESPONSE_LIMIT + 21
+    envelopes = [bytes(600000)] * 4
+    assert response(7, envelopes) == rlp([7, envelopes[:3]])
+    assert response(7, envelopes[3:]) == rlp([7, envelopes[3:]])
+
+    # Transport fixtures only: hashes bind envelope bytes independently of pool admission.
+    a, b, c = [b"\x06" + rlp([i]) for i in range(3)]
+    requested = [h(a), h(b), h(c)]
+    check_envelopes(requested, [a, b, c])
+    check_envelopes(requested, [a, c])  # Missing middle entry is allowed.
+    check_envelopes(requested, [c])     # Missing prefix is allowed.
+    check_envelopes(requested, [a])     # Truncated response is allowed.
+    check_envelopes(requested, [])
+    expect_error(check_envelopes, requested, [a, a])
+    expect_error(check_envelopes, requested, [c, a])
+    expect_error(check_envelopes, requested, [b"\x06\xc0"])
+    expect_error(check_envelopes, requested, [a, b, c, a])
+
+    print(f"PASS: {len(vectors)} vectors, content hashes, message encodings, response limits, "
+          f"pooled-envelope matching, wrapper placeholders; proof room at list ceilings {proof_room} bytes")
 
 
 if __name__ == "__main__":
