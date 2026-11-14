@@ -20,6 +20,8 @@ MAX_WRAPPER_BYTES = SOFT_RESPONSE_LIMIT
 MAX_ANNOUNCEMENTS = 64
 MAX_WRAPPERS_PER_REQUEST = 32
 LEANSPHINCS_SCHEME = 0x10
+LEANSTARK_SCHEME = 0x11
+MAX_RAW_WITNESS_BYTES = 16 * 1024
 FRAME_TX_TYPE = b"\x06"
 CELLS_PER_EXT_BLOB = 128
 
@@ -57,7 +59,7 @@ def pattern(size):
 
 def describe(mode, body, deps_hash, txs_hash):
     # Each entry is [mode, length, hash, deps-hash, txs-hash].
-    if mode not in (0, 1):
+    if mode not in (0, 1, 2):
         raise ValueError("wrapper mode")
     if not 1 <= len(body) <= MAX_WRAPPER_BYTES:
         raise ValueError("wrapper size")
@@ -133,7 +135,10 @@ def metadata_for(item):
 
 def may_skip_fetch(announcement, held_valid_wrappers):
     # Caller supplies only wrappers valid under the current rules.
-    return any(tuple(announcement[3:]) == coverage(item) for item in held_valid_wrappers)
+    # Native-validated raw witnesses cannot suppress proof-backed coverage.
+    return any((item[1] != 2 or announcement[0] == 2)
+               and tuple(announcement[3:]) == coverage(item)
+               for item in held_valid_wrappers)
 
 
 def wrapper_vectors():
@@ -161,7 +166,7 @@ def wrapper_vectors():
     return out
 
 
-def check_announcements(entries):
+def check_announcements(entries, supported_modes=(0, 1, 2)):
     assert 1 <= len(entries) <= MAX_ANNOUNCEMENTS, "announcement count"
     for entry in entries:
         assert isinstance(entry, list) and len(entry) == 5, "announcement fields"
@@ -173,7 +178,7 @@ def check_announcements(entries):
         assert isinstance(txs_hash, bytes) and len(txs_hash) == 32, "announcement transaction hash"
     hashes = [entry[2] for entry in entries]
     assert hashes == sorted(set(hashes)), "announcement order"
-    return [entry for entry in entries if entry[0] in (0, 1)]
+    return [entry for entry in entries if entry[0] in supported_modes]
 
 
 def check_request(request_id, hashes, received_announcements, compact=0):
@@ -192,13 +197,24 @@ def check_wrapper_shape(item):
     envelopes, mode, content = item
     assert isinstance(content, list) and len(content) == 2, "wrapper content"
     deps, proof = content
-    assert isinstance(mode, int) and mode in (0, 1), "wrapper mode"
+    assert isinstance(mode, int) and mode in (0, 1, 2), "wrapper mode"
     assert isinstance(deps, list) and deps, "wrapper dependencies"
     assert all(isinstance(dep, bytes) and len(dep) == 96 for dep in deps), "dependency length"
     assert deps == sorted(set(deps)), "dependency order"
-    if mode == 0:
+    if mode in (0, 2):
         assert isinstance(proof, list) and len(proof) == len(deps), "direct proofs"
-        assert all(isinstance(witness, bytes) for witness in proof), "direct witness"
+        raw_count = 0
+        for dep, witness in zip(deps, proof):
+            if mode == 2 and isinstance(witness, list):
+                assert dep[:32] == uint(LEANSTARK_SCHEME, 32), "raw dependency scheme"
+                assert len(witness) == 3 and all(isinstance(v, bytes) for v in witness), "raw witness fields"
+                assert len(witness[1]) == 32, "raw message length"
+                assert len(rlp(witness)) <= MAX_RAW_WITNESS_BYTES, "raw witness length"
+                raw_count += 1
+            else:
+                assert isinstance(witness, bytes), "direct witness"
+        if mode == 2:
+            assert raw_count, "missing raw witness"
     else:
         assert isinstance(proof, bytes) and proof, "aggregate proof"
     assert isinstance(envelopes, list) and envelopes, "wrapper envelopes"
@@ -327,7 +343,62 @@ def expect_error(reason, fn, *args):
     raise AssertionError("accepted invalid input: " + reason)
 
 
+def check_raw_witness_cases():
+    # Synthetic keys/signatures exercise transport, not cryptographic validity
+    # or native/leaf equivalence. No production program keys are assigned here.
+    profiles = [(b"mldsa44-pure-v1", 1312, 2420),
+                (b"falcon512-padded-v1", 897, 666),
+                (b"slhdsa-shake128s-pure-v1", 32, 7856)]
+    for profile, pk_size, sig_size in profiles:
+        pk, message, signature = pattern(pk_size), bytes(32), pattern(sig_size)
+        claim = h(b"EIP8437:raw:v1" + rlp([profile, pk, message]))
+        key = h(b"synthetic key:" + profile)
+        dep = uint(LEANSTARK_SCHEME, 32) + claim + key
+        witness = [pk, message, signature]
+        raw = [[transaction(1)], 2, [[dep], [witness]]]
+        body = rlp(raw)
+        announcement = describe(2, body, *coverage(raw))
+        assert check_announcements([announcement]) == [announcement]
+        assert check_announcements([announcement], (0, 1)) == []
+        check_wrapper_response(7, [h(body)], {h(body): metadata_for(raw)}, reply_for(7, [raw]))
+
+        # Mode changes preserve coverage hints but never confer proof coverage.
+        proven = [raw[0], 1, [[dep], b"synthetic aggregate proof"]]
+        direct = [raw[0], 0, [[dep], [b"synthetic singleton proof"]]]
+        for other in (direct, proven):
+            other_announcement = describe(other[1], rlp(other), *coverage(other))
+            assert not may_skip_fetch(other_announcement, [raw])
+            assert may_skip_fetch(announcement, [other])
+        assert may_skip_fetch(announcement, [raw])
+
+        # Mixed native and raw witnesses, under the existing direct limits.
+        native_dep = uint(LEANSPHINCS_SCHEME, 32) + bytes(64)
+        mixed = [raw[0], 2, [[native_dep, dep], [b"synthetic signature", witness]]]
+        check_wrapper_shape(mixed)
+        expect_error("raw dependency scheme", check_wrapper_shape,
+                     [raw[0], 2, [[native_dep], [witness]]])
+        expect_error("direct witness", check_wrapper_shape, [raw[0], 0, raw[2]])
+        expect_error("missing raw witness", check_wrapper_shape, [raw[0], 2, direct[2]])
+        expect_error("raw witness fields", check_wrapper_shape,
+                     [raw[0], 2, [[dep], [witness[:2]]]])
+        expect_error("raw message length", check_wrapper_shape,
+                     [raw[0], 2, [[dep], [[pk, bytes(31), signature]]]])
+        expect_error("raw witness length", check_wrapper_shape,
+                     [raw[0], 2, [[dep], [[pk, message, bytes(MAX_RAW_WITNESS_BYTES)]]]])
+
+        # Transaction omission also round-trips mode 2; witnesses stay in full.
+        tx = raw[0][0]
+        compact = compact_wrapper(raw, {h(tx)})
+        assert compact[2] == raw[2]
+        assert reconstruct(compact, 1, {h(tx): tx}, len(body)) == raw
+        assert reconstruct(compact, 1, {}, len(body)) is None
+        altered = [raw[0], 2, [[dep], [[pk, message, signature[:-1] + b"x"]]]]
+        assert h(rlp(altered)) != h(body)
+        assert coverage(altered) == coverage(raw)  # Hints cannot prove validity.
+
+
 def main():
+    check_raw_witness_cases()
     assert h(b"").hex() == "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
     assert rlp(0) == b"\x80" and rlp([]) == b"\xc0"
     assert rlp(b"dog").hex() == "83646f67"
@@ -339,9 +410,9 @@ def main():
     wrappers = json.loads(Path(__file__).with_name("wrapper-vectors.json").read_text())
     assert wrapper_vectors() == wrappers
 
-    # RLP prefix expansion makes the maximum entry 106 bytes in either mode.
+    # RLP prefix expansion makes the maximum entry 106 bytes in all three modes.
     assert MAX_WRAPPER_BYTES == SOFT_RESPONSE_LIMIT
-    for mode in (0, 1):
+    for mode in (0, 1, 2):
         assert len(rlp([mode, MAX_WRAPPER_BYTES, bytes(32), bytes(32), bytes(32)])) == 106
 
     # Announcement count, fields and strict hash ordering.
@@ -356,7 +427,7 @@ def main():
         expect_error("announcement length", check_announcements, [[0, length, bytes(32), bytes(32), bytes(32)]])
     for mode in (-1, b"\x01"):
         expect_error("announcement mode", check_announcements, [[mode, 1, bytes(32), bytes(32), bytes(32)]])
-    for mode in (2, 256):
+    for mode in (3, 256):
         unknown = [mode, 1, bytes(32), bytes(32), bytes(32)]
         known = [0, 1, bytes([1]) * 32, bytes(32), bytes(32)]
         assert check_announcements([unknown]) == []
@@ -608,8 +679,9 @@ def main():
                  {h(tx): tx for tx in oversized[0]}, MAX_WRAPPER_BYTES)
 
     print("PASS: announcement, full-envelope and sparse-blob wrapper encoding vectors; "
+          "mode 2 raw-witness encodings and proof-coverage suppression; "
           "compact reconstruction and full retries, message counts, ordering, metadata matching, byte limits and response packing. "
-          "Transaction/proof validity, KZG verification and client-state sequences are not tested.")
+          "Transaction/proof/signature validity, native/leaf equivalence, KZG verification and client-state sequences are not tested.")
 
 
 if __name__ == "__main__":
