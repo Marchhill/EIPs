@@ -22,6 +22,8 @@ MAX_WRAPPERS_PER_REQUEST = 32
 LEANSPHINCS_SCHEME = 0x10
 LEANSTARK_SCHEME = 0x11
 MAX_RAW_WITNESS_BYTES = 16 * 1024
+MAX_RAW_ENTRIES = 16
+MAX_RAW_TRANSACTIONS = 64
 FRAME_TX_TYPE = b"\x06"
 CELLS_PER_EXT_BLOB = 128
 
@@ -166,7 +168,7 @@ def wrapper_vectors():
     return out
 
 
-def check_announcements(entries, supported_modes=(0, 1, 2)):
+def check_announcements(entries, supported_modes=(0, 1, 2), recognized_keys=None):
     assert 1 <= len(entries) <= MAX_ANNOUNCEMENTS, "announcement count"
     for entry in entries:
         assert isinstance(entry, list) and len(entry) == 5, "announcement fields"
@@ -178,7 +180,8 @@ def check_announcements(entries, supported_modes=(0, 1, 2)):
         assert isinstance(txs_hash, bytes) and len(txs_hash) == 32, "announcement transaction hash"
     hashes = [entry[2] for entry in entries]
     assert hashes == sorted(set(hashes)), "announcement order"
-    return [entry for entry in entries if entry[0] in supported_modes]
+    return [entry for entry in entries if entry[0] in supported_modes
+            and (entry[0] != 2 or recognized_keys is None or recognized_keys)]
 
 
 def check_request(request_id, hashes, received_announcements, compact=0):
@@ -202,7 +205,7 @@ def check_wrapper_shape(item):
     assert all(isinstance(dep, bytes) and len(dep) == 96 for dep in deps), "dependency length"
     assert deps == sorted(set(deps)), "dependency order"
     if mode in (0, 2):
-        assert isinstance(proof, list) and len(proof) == len(deps), "direct proofs"
+        assert isinstance(proof, list) and len(proof) == len(deps), "witness count"
         raw_count = 0
         for dep, witness in zip(deps, proof):
             if mode == 2 and isinstance(witness, list):
@@ -215,11 +218,23 @@ def check_wrapper_shape(item):
                 assert isinstance(witness, bytes), "direct witness"
         if mode == 2:
             assert raw_count, "missing raw witness"
+            assert raw_count <= MAX_RAW_ENTRIES, "raw entry count"
     else:
         assert isinstance(proof, bytes) and proof, "aggregate proof"
     assert isinstance(envelopes, list) and envelopes, "wrapper envelopes"
+    if mode == 2:
+        assert len(envelopes) <= MAX_RAW_TRANSACTIONS, "raw transaction count"
     hashes = [transaction_hash(tx) for tx in envelopes]
     assert hashes == sorted(set(hashes)), "transaction order"
+
+
+def check_direct_witness_limits(item):
+    # EIP-8288 direct-witness limits; these are validation, not RLP errors.
+    # Raw entries have their separate mode 2 limits, checked above.
+    assert item[1] in (0, 2)
+    direct = [dep for dep, witness in zip(*item[2]) if isinstance(witness, bytes)]
+    assert sum(dep[:32] == uint(LEANSPHINCS_SCHEME, 32) for dep in direct) <= 16, "native witness limit"
+    assert sum(dep[:32] == uint(LEANSTARK_SCHEME, 32) for dep in direct) <= 1, "generic proof limit"
 
 
 def reply_for(request_id, wrappers):
@@ -351,7 +366,8 @@ def check_raw_witness_cases():
                 (b"slhdsa-shake128s-pure-v1", 32, 7856)]
     for profile, pk_size, sig_size in profiles:
         pk, message, signature = pattern(pk_size), bytes(32), pattern(sig_size)
-        claim = h(b"EIP8437:raw:v1" + rlp([profile, pk, message]))
+        # Opaque synthetic claim: production claim encoding is program-defined.
+        claim = h(b"synthetic claim:" + profile)
         key = h(b"synthetic key:" + profile)
         dep = uint(LEANSTARK_SCHEME, 32) + claim + key
         witness = [pk, message, signature]
@@ -360,6 +376,12 @@ def check_raw_witness_cases():
         announcement = describe(2, body, *coverage(raw))
         assert check_announcements([announcement]) == [announcement]
         assert check_announcements([announcement], (0, 1)) == []
+        # A mode-2-capable peer with no recognized programs neither fetches nor
+        # reports an error; it still validates the announcement's wire fields.
+        assert check_announcements([announcement], recognized_keys=set()) == []
+        bad_length = [2, MAX_WRAPPER_BYTES + 1, *announcement[2:]]
+        expect_error("announcement length", check_announcements,
+                     [bad_length], (0, 1, 2), set())
         check_wrapper_response(7, [h(body)], {h(body): metadata_for(raw)}, reply_for(7, [raw]))
 
         # Mode changes preserve coverage hints but never confer proof coverage.
@@ -371,10 +393,38 @@ def check_raw_witness_cases():
             assert may_skip_fetch(announcement, [other])
         assert may_skip_fetch(announcement, [raw])
 
-        # Mixed native and raw witnesses, under the existing direct limits.
+        # Mixed native and raw witnesses, under the separate direct/raw limits.
         native_dep = uint(LEANSPHINCS_SCHEME, 32) + bytes(64)
         mixed = [raw[0], 2, [[native_dep, dep], [b"synthetic signature", witness]]]
         check_wrapper_shape(mixed)
+        check_direct_witness_limits(mixed)
+        second_raw = uint(LEANSTARK_SCHEME, 32) + h(b"second raw") + key
+        proof_dep = uint(LEANSTARK_SCHEME, 32) + h(b"proven claim") + key
+        pairs = sorted([(dep, witness), (second_raw, witness),
+                        (proof_dep, b"synthetic singleton proof")])
+        mixed_generic = [sorted([transaction(i) for i in range(3)], key=transaction_hash),
+                         2, [[pair[0] for pair in pairs], [pair[1] for pair in pairs]]]
+        check_wrapper_shape(mixed_generic)
+        check_direct_witness_limits(mixed_generic)
+        too_many_proofs = [mixed_generic[0], 2,
+                          [mixed_generic[2][0], [witness, b"proof A", b"proof B"]]]
+        check_wrapper_shape(too_many_proofs)
+        expect_error("generic proof limit", check_direct_witness_limits, too_many_proofs)
+
+        # A shared dependency does not exempt additional transactions from the cap.
+        many_txs = sorted([transaction(i) for i in range(65)], key=transaction_hash)
+        check_wrapper_shape([many_txs[:64], 2, raw[2]])
+        expect_error("raw transaction count", check_wrapper_shape, [many_txs, 2, raw[2]])
+        many_deps = sorted(uint(LEANSTARK_SCHEME, 32) + h(uint(i, 4)) + key for i in range(17))
+        check_wrapper_shape([many_txs[:16], 2, [many_deps[:16], [witness] * 16]])
+        expect_error("raw entry count", check_wrapper_shape,
+                     [many_txs[:17], 2, [many_deps, [witness] * 17]])
+
+        # Dependency/witness count mismatches are malformed in both modes.
+        for item in (raw, direct):
+            for entries in ([], item[2][1] * 2):
+                expect_error("witness count", check_wrapper_shape,
+                             [item[0], item[1], [item[2][0], entries]])
         expect_error("raw dependency scheme", check_wrapper_shape,
                      [raw[0], 2, [[native_dep], [witness]]])
         expect_error("direct witness", check_wrapper_shape, [raw[0], 0, raw[2]])
@@ -681,7 +731,7 @@ def main():
     print("PASS: announcement, full-envelope and sparse-blob wrapper encoding vectors; "
           "mode 2 raw-witness encodings and proof-coverage suppression; "
           "compact reconstruction and full retries, message counts, ordering, metadata matching, byte limits and response packing. "
-          "Transaction/proof/signature validity, native/leaf equivalence, KZG verification and client-state sequences are not tested.")
+          "Transaction/proof/signature validity, native-to-leaf conformance, KZG verification and client-state sequences are not tested.")
 
 
 if __name__ == "__main__":
