@@ -436,6 +436,26 @@ def check_raw_witness_cases():
         expect_error("raw witness length", check_wrapper_shape,
                      [raw[0], 2, [[dep], [[pk, message, bytes(MAX_RAW_WITNESS_BYTES)]]]])
 
+        # Announcement length cannot reveal body-level mode 2 limits. Reject
+        # these bodies before calling any signature/proof verifier.
+        verification_calls = []
+        def verify_stub(item):
+            verification_calls.append(item)
+            return True
+        oversized_items = [
+            ("raw transaction count", [many_txs, 2, raw[2]]),
+            ("raw entry count", [many_txs[:17], 2, [many_deps, [witness] * 17]]),
+            ("raw witness length", [raw[0], 2, [[dep], [[pk, message, bytes(MAX_RAW_WITNESS_BYTES)]]]]),
+        ]
+        for reason, item in oversized_items:
+            item_body = rlp(item)
+            digest = h(item_body)
+            assert check_announcements([describe(2, item_body, *coverage(item))])
+            expect_error(reason, check_wrapper_response, 7, [digest],
+                         {digest: metadata_for(item)}, reply_for(7, [item]),
+                         0, None, verify_stub)
+        assert verification_calls == []
+
         # Transaction omission also round-trips mode 2; witnesses stay in full.
         tx = raw[0][0]
         compact = compact_wrapper(raw, {h(tx)})

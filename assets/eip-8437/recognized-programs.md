@@ -27,7 +27,9 @@ This is an account-defined digest, not the unmodified transaction signature hash
 The exact keys, program-specific claim definitions and cryptographic conformance vectors are outstanding. No TBD key is enabled. Each descriptor must publish:
 
 - The exact key hash, canonical key encoding and reproducible program source/build, including the claim encoding, active generic statement and resource bounds it targets.
-- Vectors showing that every native-accepted witness produces the same claim in the leaf. Cover altered keys, messages, signatures, claims and parameters; wrong lengths; context and prehash confusion; Falcon padding and ML-DSA hint-encoding edge cases. Record stricter native rejections separately; they need not be leaf rejections.
+- Vectors showing that every native-accepted witness produces the same claim in the leaf. Cover altered keys, messages, signatures, claims and parameters; wrong lengths; context and prehash confusion; Falcon padding and ML-DSA hint-encoding edge cases.
 - Native verification and proving benchmarks within the active resource bounds, including malformed-input rejection. Recognition does not promise a particular batch size or proving deadline.
+
+For each vector, record the native result and the independently tested leaf result: proves the expected claim, rejects, or untested/inconclusive. Classify a rejection as native-only only after the leaf proves that claim; confirmed rejection by both is a separate case. Native rejection alone establishes neither result. In particular, ML-DSA hint cases remain unclassified until tested against the pinned leaf. A native acceptance with an untested or inconclusive leaf result is not a conformance pass.
 
 Adding a profile or changing a program uses a new descriptor and, when the proven predicate changes, a new key. Clients opt into recognized keys through software or configuration updates. Existing transactions still name their original key; supporting a replacement does not rewrite them. Programs outside active consensus resource bounds require a consensus change before this transport can make them usable.
