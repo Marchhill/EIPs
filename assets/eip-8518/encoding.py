@@ -38,58 +38,60 @@ def pattern(size):
 def versioned_hash(commitment):
     return b"\x01" + sha256(commitment).digest()[1:]
 
+# Test-only verifier addresses: the core proposal has not assigned them.
+NATIVE = bytes.fromhex("11" * 20)
+CUSTOM = bytes.fromhex("22" * 20)
+
 def transaction_body(nonce, commitments=()):
-    # Structurally encoded frame payload, not an executable valid transaction.
-    return [1, nonce, bytes(20), [bytes(32)], [], [1, 1, int(bool(commitments))],
+    native = [NATIVE, h(b"key"), h(b"message" + uint(nonce, 4)), 0, 0]
+    custom = [CUSTOM, h(b"other key"), h(b"other message"), 10000, 4]
+    return [1, nonce, bytes(20), [native, native, custom], [], [1, 1, 1],
             [versioned_hash(c) for c in commitments]]
 
-def transaction(nonce):
-    return FRAME_TX_TYPE + rlp(transaction_body(nonce))
+def transaction(nonce=0, blob=False):
+    commitments = [bytes([1]) * 48] if blob else []
+    sidecar = [[], commitments, [bytes(48)] * CELLS_PER_EXT_BLOB] if blob else []
+    return FRAME_TX_TYPE + rlp([transaction_body(nonce, commitments), 0,
+                              [b"signature" * 8, b"signature" * 8, b"test"], sidecar])
 
-def blob_transaction(nonce=2):
-    # Synthetic KZG encodings: these are not curve points or valid cell proofs.
-    commitments = [bytes([i + 1]) * 48 for i in range(2)]
-    proofs = [bytes([i % 251]) * 48 for i in range(2 * CELLS_PER_EXT_BLOB)]
-    return [transaction_body(nonce, commitments), 1, [], commitments, proofs]
-
-def transaction_hash(encoded):
-    assert isinstance(encoded, bytes) and len(encoded) > 1 and encoded[:1] == FRAME_TX_TYPE, "transaction envelope"
-    payload = decode(encoded[1:], strict=True)
-    assert isinstance(payload, list), "transaction payload"
-    if len(payload) == 5:
-        body, version, blobs, commitments, proofs = payload
-        assert isinstance(body, list) and len(body) == 7, "transaction payload"
-        assert version == b"\x01", "blob wrapper version"
+def pooled_parts(encoded):
+    assert isinstance(encoded, bytes) and encoded[:1] == FRAME_TX_TYPE, "transaction envelope"
+    parts = decode(encoded[1:], strict=True)
+    assert isinstance(parts, list) and len(parts) == 4, "pooled fields"
+    body, version, witnesses, sidecar = parts
+    assert isinstance(body, list) and len(body) == 7, "transaction body"
+    assert version == b"", "pooled version"
+    assert isinstance(witnesses, list) and len(witnesses) == len(body[3]), "witness count"
+    assert all(isinstance(w, bytes) for w in witnesses), "witness encoding"
+    if body[6]:
+        assert isinstance(sidecar, list) and len(sidecar) == 3, "blob sidecar"
+        blobs, commitments, proofs = sidecar
         assert blobs == [], "blob data elision"
-        hashes = body[6]
-        assert isinstance(hashes, list) and hashes, "blob hashes"
-        assert isinstance(commitments, list) and len(commitments) == len(hashes), "commitment count"
+        assert len(commitments) == len(body[6]), "commitment count"
         assert all(isinstance(c, bytes) and len(c) == 48 for c in commitments), "commitment encoding"
-        assert [versioned_hash(c) for c in commitments] == hashes, "commitment hash"
-        assert isinstance(proofs, list) and len(proofs) == CELLS_PER_EXT_BLOB * len(commitments), "cell proof count"
+        assert [versioned_hash(c) for c in commitments] == body[6], "commitment hash"
+        assert len(proofs) == len(commitments) * CELLS_PER_EXT_BLOB, "cell proof count"
         assert all(isinstance(p, bytes) and len(p) == 48 for p in proofs), "cell proof encoding"
     else:
-        body = payload
-        assert len(body) == 7, "transaction payload"
-        assert body[6] == [], "missing blob metadata"
-    return h(FRAME_TX_TYPE + rlp(body))
+        assert sidecar == [], "unexpected sidecar"
+    return parts
 
-def frame_payload(encoded):
-    # The EIP-8141 payload, unwrapped from the blob network form if present.
-    transaction_hash(encoded)
-    payload = decode(encoded[1:], strict=True)
-    return payload[0] if len(payload) == 5 else payload
+def transaction_hash(encoded):
+    return h(FRAME_TX_TYPE + rlp(pooled_parts(encoded)[0]))
 
-def frame_gas(payload):
-    # The sum of the frames' execution and state limits. Synthetic frames carry
-    # no limits, so fixtures use a fixed stand-in.
-    return SYNTHETIC_FRAME_GAS
+def aggregatable(claim):
+    # Fixture mapping only. Activation requires the core fork's actual mapping.
+    return claim[0] == NATIVE
 
-def check_claims(serving_peer, item, claims, expected):
-    # Metadata is kept per peer: the wrapper is checked against its serving
-    # peer's claim, and other peers' claims found false count against them.
-    assert claims[serving_peer] == expected(item), "announced transaction metadata"
-    return sorted(peer for peer, claim in claims.items() if claim != expected(item))
+def dependencies(encoded):
+    # Fixtures use explicit 32-byte keys/messages; core resolution is not tested.
+    return sorted(set(uint(0x10, 32) + c[2] + c[1]
+                      for c in pooled_parts(encoded)[0][3] if aggregatable(c)))
+
+def normalize(encoded):
+    body, version, witnesses, sidecar = pooled_parts(encoded)
+    return FRAME_TX_TYPE + rlp([body, version,
+        [b"" if aggregatable(c) else w for c, w in zip(body[3], witnesses)], sidecar])
 
 def reply_for(request_id, wrappers):
     return [request_id, [[h(rlp(item)), item] for item in wrappers]]
