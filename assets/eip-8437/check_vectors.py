@@ -2,11 +2,20 @@
 """Check EIP-8437 eth/75 encoding fixtures and message rules.
 
 Synthetic envelopes and witnesses do not test execution, cryptographic validity,
-KZG verification or client state. Requires Python 3.9+, pycryptodome and rlp.
-Run: python3 assets/eip-8437/check_vectors.py
+KZG verification or client state. proof-vectors.json carries real EIP-8288
+wrappers; this checks their encoding, hashes, hints and announcements, not their
+proofs, which need the verifier recorded in the file. Requires Python 3.9+,
+pycryptodome and rlp. Run: python3 assets/eip-8437/check_vectors.py
+
+Regenerate proof-vectors.json from Nethermind's Eip8288Bench (Linux x64/arm64):
+    dotnet publish tools/Eip8288Bench -c Release -r linux-x64 --self-contained false -o <tool>
+    dotnet <tool>/Eip8288Bench.dll eip-vectors --out=<dir>
+    python3 assets/eip-8437/check_vectors.py --compose <dir>/eip-vectors.json <nethermind commit>
 """
 
 import json
+import re
+import sys
 from hashlib import sha256
 from pathlib import Path
 
@@ -123,6 +132,8 @@ def frame_payload(encoded):
 def frame_gas(payload):
     # The sum of the frames' execution and state limits. Synthetic frames carry
     # no limits, so fixtures use a fixed stand-in.
+    if all(isinstance(frame, list) for frame in payload[3]):
+        return sum(int.from_bytes(limit, "big") for frame in payload[3] for limit in frame[3])
     return SYNTHETIC_FRAME_GAS
 
 
@@ -346,7 +357,98 @@ def wrapper_vectors():
     return out
 
 
+PROOF_OUTCOMES = {True: "accept", False: "discard-without-penalty"}
+PROOF_DESCRIPTIONS = {
+    "mode0": "Valid leanSPHINCS witness for one dependency shared by two transactions",
+    "mode0-flipped-witness": "mode0 with one witness byte flipped: fails witness verification",
+    "mode0-unknown-scheme": "Well-formed wrapper whose dependency has unknown scheme 0x12: discard without verifying",
+}
+PROOF_FORK = ("Any mempool fork enabling EIP-8288 with this verifier: AGGREGATED_VK and the pinned leanSPHINCS "
+              "parameters, whose public key the dependencies carry. Verdicts do not depend on chain state; chain_id "
+              "is the transactions' chain.")
+
+
+def snake(value):
+    if isinstance(value, dict):
+        return {re.sub(r"(?<!^)(?=[A-Z])", "_", key).lower(): snake(item) for key, item in value.items()}
+    return value
+
+
+def proof_item(body, chain_id):
+    # A real wrapper in this checker's representation, with an integer mode.
+    envelopes, raw_mode, content = decode(body, strict=True)
+    mode = int.from_bytes(raw_mode, "big")
+    item = [envelopes, mode, content]
+    assert rlp(item) == body, "canonical wrapper"
+    check_wrapper_shape(item)
+    assert all(int.from_bytes(frame_payload(tx)[0], "big") == chain_id for tx in envelopes), "chain id"
+    return item
+
+
+def proof_vector(name, body, valid, chain_id, mutation=None):
+    item = proof_item(body, chain_id)
+    vector = {"name": name, "description": PROOF_DESCRIPTIONS[name], "expected": PROOF_OUTCOMES[valid]}
+    vector.update({"body": body.hex()} if mutation is None else {"mutation": mutation})
+    vector.update({"length": len(body), "content_hash": h(body).hex(),
+                   "deps_hash": h(b"".join(item[2][0])).hex(),
+                   "txs_hash": h(b"".join(transaction_hash(tx) for tx in item[0])).hex(),
+                   "transaction_hashes": [transaction_hash(tx).hex() for tx in item[0]],
+                   "announcement_rlp": rlp(describe(0, body, inline_metadata(item))).hex()})
+    return vector
+
+
+def proof_vectors(raw, generator):
+    # A mutation flips bytes of the previous vector given in full.
+    vectors, base = [], None
+    for entry in raw["eip8437"]:
+        mutation = None
+        if "wrapper" in entry:
+            body = base = bytes.fromhex(entry["wrapper"].removeprefix("0x"))
+        else:
+            mutation = {"of": vectors[-1]["mutation"]["of"] if "mutation" in vectors[-1] else vectors[-1]["name"],
+                        "offset": entry["mutation"]["offset"], "xor": entry["mutation"]["xor"]}
+            body = bytearray(base)
+            body[mutation["offset"]] ^= mutation["xor"]
+            body = bytes(body)
+        vectors.append(proof_vector(entry["name"], body, entry["valid"], raw["chainId"], mutation))
+    return {"chain_id": raw["chainId"], "mempool_fork": PROOF_FORK, "verifier": snake(raw["verifier"]),
+            "generator": generator, "vectors": vectors}
+
+
+def check_proof_vectors():
+    path = Path(__file__).with_name("proof-vectors.json")
+    expected = json.loads(path.read_text())
+    raw = {"chainId": expected["chain_id"], "verifier": expected["verifier"], "eip8437": [
+        {"name": v["name"], "valid": v["expected"] == "accept",
+         **({"wrapper": v["body"]} if "body" in v else {"mutation": v["mutation"]})} for v in expected["vectors"]]}
+    assert proof_vectors(raw, expected["generator"]) == expected, "proof vectors"
+    bodies = {}
+    for vector in expected["vectors"]:
+        if "body" in vector:
+            body = bytes.fromhex(vector["body"])
+        else:
+            body = bytearray(bodies[vector["mutation"]["of"]])
+            body[vector["mutation"]["offset"]] ^= vector["mutation"]["xor"]
+            body = bytes(body)
+            item = proof_item(body, expected["chain_id"])
+            # The flip lies inside the last witness, so only proof verification fails.
+            assert vector["mutation"]["offset"] >= len(body) - len(item[2][1][-1]), "mutation inside witness"
+        bodies[vector["name"]] = body
+        item = proof_item(body, expected["chain_id"])
+        digest = h(body)
+        check_wrapper_response(7, [digest], {digest: metadata_for(item)}, reply_for(7, [item]))
+        supported = all(dep[:32] == uint(LEANSPHINCS_SCHEME, 32) for dep in item[2][0])
+        assert supported or vector["expected"] == "discard-without-penalty", "unsupported scheme outcome"
+
+
 def main():
+    if sys.argv[1:2] == ["--compose"]:
+        raw = json.loads(Path(sys.argv[2]).read_text())
+        generator = {"repository": "https://github.com/Marchhill/nethermind", "branch": "test/eip8288-wire-fixtures",
+                     "commit": sys.argv[3], "command": "Eip8288Bench eip-vectors"}
+        Path(__file__).with_name("proof-vectors.json").write_text(
+            json.dumps(proof_vectors(raw, generator), indent=2) + "\n")
+        return
     assert h(b"").hex() == "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
     assert rlp(0) == b"\x80" and rlp([]) == b"\xc0"
     assert rlp(b"dog").hex() == "83646f67"
@@ -517,7 +619,9 @@ def main():
         expect_error("blob data elision", transaction_hash, FRAME_TX_TYPE + rlp(blob[:2] + [value] + blob[3:]))
     expect_error("commitment hash", transaction_hash, FRAME_TX_TYPE + rlp(blob[:3] + [blob[3][::-1], blob[4]]))
     expect_error("cell proof count", transaction_hash, FRAME_TX_TYPE + rlp(blob[:4] + [blob[4][:-1]]))
-    print("PASS: eth/75 leanSPHINCS scope, encoding, metadata, full retrieval, ordering, size and blob checks. "
+    check_proof_vectors()
+    print("PASS: eth/75 leanSPHINCS scope, encoding, metadata, full retrieval, ordering, size and blob checks, "
+          "and the real-proof vectors' encoding, hashes and announcements. "
           "Transaction/proof validity, KZG verification and client state are not tested.")
 
 
