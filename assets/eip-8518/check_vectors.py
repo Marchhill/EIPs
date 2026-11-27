@@ -3,12 +3,22 @@
 
 Scalars are represented as Python integers. This checks encoding and blob
 metadata binding, not transaction execution, proof validity or client state.
+proof-vectors.json carries real EIP-8288 aggregates; this checks their encoding,
+hashes, hints and announcements, not their proofs, which need the verifier
+recorded in the file.
 
 Requires Python 3.9+, pycryptodome and rlp. Run with:
     python3 assets/eip-8518/check_vectors.py
+
+Regenerate proof-vectors.json from Nethermind's Eip8288Bench (Linux x64/arm64):
+    dotnet publish tools/Eip8288Bench -c Release -r linux-x64 --self-contained false -o <tool>
+    dotnet <tool>/Eip8288Bench.dll eip-vectors --out=<dir>
+    python3 assets/eip-8518/check_vectors.py --compose <dir>/eip-vectors.json <nethermind commit>
 """
 
 import json
+import re
+import sys
 from pathlib import Path
 
 from rlp import decode
@@ -377,7 +387,99 @@ def can_send_wrapper(version, item, enabled_schemes):
     return version == 76 and item[1] in (0, 1)
 
 
+PROOF_OUTCOMES = {True: "accept", False: "discard-without-penalty"}
+PROOF_DESCRIPTIONS = {
+    "mode1": "Valid recursive proof of one leanSPHINCS dependency shared by two transactions",
+    "mode1-corrupted-proof": "mode1 with one recursive-proof byte flipped: fails proof verification",
+    "mode1-same-coverage": "Valid recursive proof of mode1's dependencies and transactions with different proof bytes",
+}
+PROOF_FORK = ("Any mempool fork enabling EIP-8288 with this verifier: AGGREGATED_VK and the pinned leanSPHINCS "
+              "parameters, whose public key the dependencies carry. Verdicts do not depend on chain state; chain_id "
+              "is the transactions' chain.")
+
+
+def snake(value):
+    if isinstance(value, dict):
+        return {re.sub(r"(?<!^)(?=[A-Z])", "_", key).lower(): snake(item) for key, item in value.items()}
+    return value
+
+
+def proof_item(body, chain_id):
+    # A real wrapper in this checker's representation, with an integer mode.
+    envelopes, raw_mode, content = decode(body, strict=True)
+    mode = int.from_bytes(raw_mode, "big")
+    item = [envelopes, mode, content]
+    assert rlp(item) == body, "canonical wrapper"
+    check_wrapper_shape(item)
+    assert all(int.from_bytes(frame_payload(tx)[0], "big") == chain_id for tx in envelopes), "chain id"
+    return item
+
+
+def proof_vector(name, body, valid, chain_id, mutation=None):
+    item = proof_item(body, chain_id)
+    deps_hash, txs_hash = coverage(item)
+    vector = {"name": name, "description": PROOF_DESCRIPTIONS[name], "expected": PROOF_OUTCOMES[valid]}
+    vector.update({"body": body.hex()} if mutation is None else {"mutation": mutation})
+    vector.update({"length": len(body), "content_hash": h(body).hex(),
+                   "deps_hash": deps_hash.hex(), "txs_hash": txs_hash.hex(),
+                   "transaction_hashes": [transaction_hash(tx).hex() for tx in item[0]],
+                   "announcement_rlp": rlp(describe(item[1], body, deps_hash, txs_hash, inline_metadata(item))).hex()})
+    return vector
+
+
+def proof_vectors(raw, generator):
+    # A mutation flips bytes of the previous vector given in full.
+    vectors, base = [], None
+    for entry in raw["eip8518"]:
+        mutation = None
+        if "wrapper" in entry:
+            body = base = bytes.fromhex(entry["wrapper"].removeprefix("0x"))
+        else:
+            mutation = {"of": vectors[-1]["mutation"]["of"] if "mutation" in vectors[-1] else vectors[-1]["name"],
+                        "offset": entry["mutation"]["offset"], "xor": entry["mutation"]["xor"]}
+            body = bytearray(base)
+            body[mutation["offset"]] ^= mutation["xor"]
+            body = bytes(body)
+        vectors.append(proof_vector(entry["name"], body, entry["valid"], raw["chainId"], mutation))
+    return {"chain_id": raw["chainId"], "mempool_fork": PROOF_FORK, "verifier": snake(raw["verifier"]),
+            "generator": generator, "vectors": vectors}
+
+
+def check_proof_vectors():
+    expected = json.loads(Path(__file__).with_name("proof-vectors.json").read_text())
+    raw = {"chainId": expected["chain_id"], "verifier": expected["verifier"], "eip8518": [
+        {"name": v["name"], "valid": v["expected"] == "accept",
+         **({"wrapper": v["body"]} if "body" in v else {"mutation": v["mutation"]})} for v in expected["vectors"]]}
+    assert proof_vectors(raw, expected["generator"]) == expected, "proof vectors"
+    bodies, items = {}, {}
+    for vector in expected["vectors"]:
+        if "body" in vector:
+            body = bytes.fromhex(vector["body"])
+        else:
+            body = bytearray(bodies[vector["mutation"]["of"]])
+            body[vector["mutation"]["offset"]] ^= vector["mutation"]["xor"]
+            body = bytes(body)
+        item = proof_item(body, expected["chain_id"])
+        if "mutation" in vector:
+            # The flip lies inside the recursive proof, so only proof verification fails.
+            assert vector["mutation"]["offset"] >= len(body) - len(item[2][1]), "mutation inside proof"
+        bodies[vector["name"]], items[vector["name"]] = body, item
+        digest = h(body)
+        check_wrapper_response(7, [digest], {digest: metadata_for(item)}, reply_for(7, [item]))
+    # Equal hints with different proof bytes: a held, validated mode1 permits skipping the other fetch.
+    same = items["mode1-same-coverage"]
+    assert coverage(same) == coverage(items["mode1"]) and rlp(same) != rlp(items["mode1"])
+    assert may_skip_fetch(describe(1, rlp(same), *coverage(same)), [items["mode1"]])
+
+
 def main():
+    if sys.argv[1:2] == ["--compose"]:
+        raw = json.loads(Path(sys.argv[2]).read_text())
+        generator = {"repository": "https://github.com/Marchhill/nethermind", "branch": "test/eip8288-wire-fixtures",
+                     "commit": sys.argv[3], "command": "Eip8288Bench eip-vectors"}
+        Path(__file__).with_name("proof-vectors.json").write_text(
+            json.dumps(proof_vectors(raw, generator), indent=2) + "\n")
+        return
     assert h(b"").hex() == "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
     assert rlp(0) == b"\x80" and rlp([]) == b"\xc0"
     assert rlp(b"dog").hex() == "83646f67"
@@ -875,7 +977,9 @@ def main():
             assert not can_send_wrapper(76, generic, native_only)
             assert can_send_wrapper(76, generic, generic_enabled)
 
-    print("PASS: announcement, full-envelope and sparse-blob wrapper encoding vectors; "
+    check_proof_vectors()
+    print("PASS: announcement, full-envelope and sparse-blob wrapper encoding vectors; real-proof vector encoding, "
+          "hashes and hints; "
           "compact reconstruction and full retries, message counts, ordering, metadata matching, "
           "transaction metadata and manifests, byte limits and response packing. "
           "Transaction/proof validity, KZG verification and client-state sequences are not tested.")
